@@ -6,11 +6,11 @@
 $maxFailedAttempts = 3  # Maximum number of failed attempts allowed
 $logName = "Security"    # Name of the security event log
 $eventID = 4625         # Event ID for authentication failure
+$lookbackMinutes = 60   # Minutes to look back in logs
 $scriptDir = "$env:APPDATA\Fail2Ban"  # Script directory using %appdata%
 $timestamp = Get-Date -Format "yyyy-MM-dd-HHmmss"
 $logFolder = "$scriptDir\logs" # Log folder
 $logFile = "$logFolder\rdp_block_log-$timestamp.txt"  # Log file with timestamp
-$statFile = "$scriptDir\failed_attempts.xml"  # File to store state between executions
 $allowlistFile = "$scriptDir\allowlist.txt"  # File to store allowed IPs
 $logRetentionDays = 2  # Number of days to retain log files
 
@@ -24,7 +24,7 @@ if (-not (Test-Path $logFolder)) {
     New-Item -ItemType Directory -Path $logFolder | Out-Null
 }
 
-# Create allowlist file if it does not exist and add the specified IP
+# Create allowlist file if it does not exist
 if (-not (Test-Path $allowlistFile)) {
     "" | Out-File -FilePath $allowlistFile
     Write-Host "Allowlist file created"
@@ -46,6 +46,7 @@ function Write-Log {
     )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "$timestamp - $message" | Out-File -FilePath $logFile -Append
+    Write-Host "$timestamp - $message"
 }
 
 # Log script execution start
@@ -95,7 +96,12 @@ function Block-IP {
     
     try {
         # Get active network interface
-        $interface = (Get-NetAdapter | Where-Object { $_.Status -eq "Up" }).Name
+        $activeInterface = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
+        if ($null -eq $activeInterface -or $activeInterface.Count -eq 0) {
+            Write-Log "Error: No active network interface found."
+            return
+        }
+        $interface = $activeInterface[0].Name
         
         # Check if the route already exists
         $existingRoute = Get-NetRoute -DestinationPrefix "$ipAddress/32" -ErrorAction SilentlyContinue
@@ -114,6 +120,9 @@ function Block-IP {
     }
 }
 
+# Initialize hashtable for failed attempts
+$failedAttempts = @{}
+
 # Initialize ArrayList for blocked IPs
 $blockedIPs = New-Object System.Collections.ArrayList
 
@@ -123,6 +132,82 @@ foreach ($ip in $currentBlockedIPs) {
     [void]$blockedIPs.Add($ip)
 }
 Write-Log "Blocked IPs found in system routes: $($blockedIPs.Count) IPs."
+
+# Fetch recent authentication failure events
+$startTime = (Get-Date).AddMinutes(-$lookbackMinutes)
+Write-Log "Fetching authentication failure events since: $startTime"
+
+try {
+    $events = Get-WinEvent -FilterHashtable @{
+        LogName = $logName
+        ID = $eventID
+        StartTime = $startTime
+    } -ErrorAction SilentlyContinue
+    
+    if ($null -eq $events) {
+        Write-Log "No authentication failure events found."
+        $events = @()
+    }
+    
+    Write-Log "Found $($events.Count) authentication failure events."
+    
+    # Process authentication failure events with improved error handling
+    foreach ($event in $events) {
+        try {
+            $ipAddress = $null
+            $userName = "Unknown"
+            
+            # Extract the IP address from the event message directly
+            # Event 4625 has the source network address in the format "Source Network Address: x.x.x.x"
+            if ($event.Message -match "Source Network Address:\s+(\d+\.\d+\.\d+\.\d+)") {
+                $ipAddress = $matches[1]
+            }
+            
+            # Extract the username from the event message
+            if ($event.Message -match "Account For Which Logon Failed:\s+Security ID:\s+[^\r\n]+\s+Account Name:\s+(\S+)") {
+                $userName = $matches[1]
+                if ($userName -eq "-") {
+                    $userName = "Unknown"
+                }
+            }
+            
+            # Check if we found a valid IP and it's not a local or empty IP
+            if ($ipAddress -and $ipAddress -ne "-" -and $ipAddress -ne "::1" -and $ipAddress -ne "127.0.0.1" -and $ipAddress -ne "0.0.0.0" -and $ipAddress -match '^\d+\.\d+\.\d+\.\d+$') {
+                Write-Log "Authentication failure detected from IP: $ipAddress (Username: $userName)"
+                
+                # Increment failed attempts counter
+                if (-not $failedAttempts.ContainsKey($ipAddress)) {
+                    $failedAttempts[$ipAddress] = 1
+                }
+                else {
+                    $failedAttempts[$ipAddress]++
+                }
+                
+                # Check if it exceeded maximum attempts
+                if ($failedAttempts[$ipAddress] -ge $maxFailedAttempts) {
+                    Write-Log "IP $ipAddress exceeded maximum failed attempts ($maxFailedAttempts)."
+                    Block-IP -ipAddress $ipAddress
+                    if (-not $blockedIPs.Contains($ipAddress)) {
+                        [void]$blockedIPs.Add($ipAddress)
+                    }
+                }
+                else {
+                    Write-Log "IP $ipAddress has $($failedAttempts[$ipAddress]) failed attempts."
+                }
+            }
+            else {
+                Write-Log "Could not extract valid IP address from event."
+            }
+        } catch {
+            Write-Log "Error processing event: $_"
+            # Continue with next event
+            continue
+        }
+    }
+}
+catch {
+    Write-Log "Error fetching events: $_"
+}
 
 # Check if any blocked IP is now in the allowlist and remove the block
 $ipsToUnblock = @()
@@ -141,15 +226,6 @@ foreach ($ip in $ipsToUnblock) {
     catch {
         Write-Log "Error removing route for allowed IP $ip`: $_"
     }
-}
-
-# Save current state for next execution
-try {
-    $failedAttempts | Export-Clixml -Path $statFile -Force
-    Write-Log "Current state saved successfully."
-}
-catch {
-    Write-Log "Error saving current state: $_"
 }
 
 Write-Log "Execution completed."
